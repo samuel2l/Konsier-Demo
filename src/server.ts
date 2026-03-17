@@ -1,54 +1,118 @@
+import "dotenv/config";
 import express from "express";
-import type { Request, Response, NextFunction } from "express";
+import type { Request, Response } from "express";
 import cors from "cors";
-import { Konsier } from "konsier";
 import { z } from "zod";
-
-// Simple in-memory storage for demo purposes
-type PickupStatus = "pending" | "in_progress" | "completed";
-
-interface Pickup {
-  id: number;
-  studentName: string;
-  fromLocation: string;
-  toLocation: string;
-  notes?: string;
-  scheduledAt?: string;
-  feeGhs: number;
-  status: PickupStatus;
-  // Konsier linkage so we can message the right person
-  konsierUserId?: string;
-  konsierConversationId?: string | number;
-}
+import { Pickup } from "./types";
+import { initKonsier, notifyPickupUser } from "./konsier";
 
 const pickups: Pickup[] = [];
 let nextPickupId = 1;
 
-const PAYSTACK_SECRET = "sk_test_ea66bd6f97f876c5d229c53e273ea5c2ef831ef0";
+const PAYSTACK_SECRET = process.env.PAYSTACK_SECRET ?? "";
 const PAYSTACK_BASE = "https://api.paystack.co";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Small helper for calling our own HTTP API from tools
-async function callApi<T>(
-  method: "GET" | "POST",
-  path: string,
-  body?: any,
-): Promise<T> {
-  const axios = (await import("axios")).default;
-  const url = `http://localhost:${process.env.PORT || 4000}${path}`;
-  const config: any = {};
-  if (method === "GET") {
-    const response = await axios.get(url, config);
-    return response.data as T;
-  }
-  const response = await axios.post(url, body ?? {}, config);
-  return response.data as T;
-}
+app.get("/admin/pickups", (_req: Request, res: Response) => {
+  const rows = pickups
+    .map(
+      (p) => `
+        <tr>
+          <td>${p.id}</td>
+          <td>${p.studentName}</td>
+          <td>${p.fromLocation}</td>
+          <td>${p.toLocation}</td>
+          <td>${p.status}</td>
+          <td>${p.feeGhs}</td>
+          <td>
+            <button data-id="${p.id}" class="checkin-btn"${
+              p.status === "completed" ? " disabled" : ""
+            }>
+              ${
+                p.status === "pending"
+                  ? "Mark in progress"
+                  : p.status === "in_progress"
+                    ? "Mark completed"
+                    : "Completed"
+              }
+            </button>
+          </td>
+        </tr>
+      `,
+    )
+    .join("");
 
-// --- Core HTTP endpoints (these are what tools will call) ---
+  const html = `<!DOCTYPE html>
+  <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>Campus Runner Pickups</title>
+      <style>
+        body { font-family: system-ui, sans-serif; padding: 1.5rem; background: #fafafa; }
+        table { border-collapse: collapse; width: 100%; background: #fff; }
+        th, td { padding: 0.5rem 0.75rem; border-bottom: 1px solid #eee; font-size: 14px; }
+        th { text-align: left; background: #f0f2f5; }
+        button { padding: 0.25rem 0.75rem; font-size: 12px; cursor: pointer; }
+        button[disabled] { opacity: 0.5; cursor: default; }
+        .toast { position: fixed; bottom: 1rem; right: 1rem; background: #111; color: #fff; padding: 0.5rem 0.75rem; border-radius: 4px; font-size: 12px; display: none; }
+      </style>
+    </head>
+    <body>
+      <h1>Campus Runner Pickups</h1>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th>
+            <th>Student</th>
+            <th>From</th>
+            <th>To</th>
+            <th>Status</th>
+            <th>Fee (GHS)</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows || '<tr><td colspan="7">No pickups yet. Create one via the bot.</td></tr>'}
+        </tbody>
+      </table>
+      <div id="toast" class="toast"></div>
+      <script>
+        function showToast(msg) {
+          var el = document.getElementById('toast');
+          el.textContent = msg;
+          el.style.display = 'block';
+          setTimeout(function () { el.style.display = 'none'; }, 2500);
+        }
+        document.addEventListener('click', function (e) {
+          var btn = e.target.closest('.checkin-btn');
+          if (!btn) return;
+          var id = btn.getAttribute('data-id');
+          if (!id) return;
+          btn.disabled = true;
+          fetch('/api/pickups/' + id + '/check-in', { method: 'POST' })
+            .then(function (res) { return res.json().then(function (data) { return { ok: res.ok, data: data }; }); })
+            .then(function (result) {
+              if (!result.ok || result.data.error) {
+                throw new Error(result.data.error || 'Failed to check in');
+              }
+              showToast('Updated pickup #' + id + ' to ' + result.data.pickup.status);
+              setTimeout(function () { window.location.reload(); }, 700);
+            })
+            .catch(function (err) {
+              showToast(err.message || 'Failed to check in');
+              btn.disabled = false;
+            });
+        });
+      </script>
+    </body>
+  </html>`;
+
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.send(html);
+});
 
 app.post("/api/pickups", async (req: Request, res: Response) => {
   const schema = z.object({
@@ -66,7 +130,7 @@ app.post("/api/pickups", async (req: Request, res: Response) => {
     return res.status(400).json({ error: "Invalid body", details: parsed.error.format() });
   }
 
-  const feeGhs = 25; // flat demo fee
+  const feeGhs = 25;
 
   const pickup: Pickup = {
     id: nextPickupId++,
@@ -107,7 +171,6 @@ app.get("/api/pickups/:id", (req: Request, res: Response) => {
 });
 
 app.get("/api/pickups", (req: Request, res: Response) => {
-  // In a real app you'd filter by authenticated user; here we just return all for demo
   return res.json({ pickups });
 });
 
@@ -142,7 +205,6 @@ app.post("/api/pickups/:id/paystack-link", async (req: Request, res: Response) =
   const pickup = pickups.find((p) => p.id === id);
   if (!pickup) return res.status(404).json({ error: "Pickup not found" });
 
-  // For demo we always allow payment, even if completed
   const axios = (await import("axios")).default;
 
   const amountKobo = Math.round(pickup.feeGhs * 100);
@@ -171,11 +233,6 @@ app.post("/api/pickups/:id/paystack-link", async (req: Request, res: Response) =
       reference: response.data.data.reference,
     };
 
-    await notifyPickupUser(
-      pickup,
-      `Here is your payment link for pickup #${pickup.id}: ${payload.authorization_url}`,
-    );
-
     return res.json(payload);
   } catch (err: any) {
     console.error("[PAYSTACK] Error initializing transaction:", err.message);
@@ -183,236 +240,10 @@ app.post("/api/pickups/:id/paystack-link", async (req: Request, res: Response) =
   }
 });
 
-// --- Konsier setup ---
-
-const endpointUrl =
-  "https://perpetually-geomorphological-alan.ngrok-free.dev/konsier";
-
-// Use an env var for the real API key in practice.
-const KONSIER_API_KEY =
-  process.env.KONSIER_API_KEY || "REPLACE_WITH_REAL_API_KEY";
-
-// Tools definitions
-const createPickupTool = Konsier.tool({
-  name: "pickup_create_from_description",
-  description:
-    "Create a new campus pickup when the student has clearly provided: their name, where items are picked up from, where they should go, and roughly when.",
-  input: z.object({
-    student_name: z.string().describe("Student's full name"),
-    from_location: z
-      .string()
-      .describe("Pickup location on campus (e.g. 'Hall A, Room 203')"),
-    to_location: z
-      .string()
-      .describe("Drop-off location on campus (e.g. 'Hall B, Reception')"),
-    notes: z
-      .string()
-      .optional()
-      .describe("Extra notes about items (e.g. '2 suitcases and a box')"),
-    scheduled_at: z
-      .string()
-      .optional()
-      .describe("Optional scheduled time, e.g. 'tomorrow 9am' or ISO string"),
-  }),
-  handler: async (input, ctx) => {
-    const body = {
-      studentName: input.student_name,
-      fromLocation: input.from_location,
-      toLocation: input.to_location,
-      notes: input.notes,
-      scheduledAt: input.scheduled_at,
-      konsierUserId: ctx.user?.id,
-      konsierConversationId: ctx.conversation?.id,
-    };
-
-    const result = await callApi<{
-      pickup_id: number;
-      fee_ghs: number;
-      status: string;
-    }>("POST", "/api/pickups", body);
-
-    return {
-      message: `Created pickup #${result.pickup_id} for ${result.fee_ghs} GHS.`,
-      pickup_id: result.pickup_id,
-      fee_ghs: result.fee_ghs,
-      status: result.status,
-    };
-  },
-});
-
-const listPickupsTool = Konsier.tool({
-  name: "pickup_list_for_student",
-  description:
-    "List recent pickups for the student so they can choose which one to ask about. Use this when they say things like 'my last pickup' or 'the one from yesterday'.",
-  input: z.object({}),
-  handler: async () => {
-    const result = await callApi<{ pickups: Pickup[] }>("GET", "/api/pickups");
-    return {
-      count: result.pickups.length,
-      pickups: result.pickups.map((p) => ({
-        id: p.id,
-        from: p.fromLocation,
-        to: p.toLocation,
-        status: p.status,
-        fee_ghs: p.feeGhs,
-        scheduled_at: p.scheduledAt ?? null,
-      })),
-    };
-  },
-});
-
-const getPickupDetailsTool = Konsier.tool({
-  name: "pickup_get_details_by_id",
-  description:
-    "Get detailed information about ONE pickup by ID, including status and fee. Use this whenever the student asks about a specific pickup.",
-  input: z.object({
-    pickup_id: z.number().int().describe("The pickup ID to look up"),
-  }),
-  handler: async (input) => {
-    const pickup = await callApi<Pickup>(
-      "GET",
-      `/api/pickups/${input.pickup_id}`,
-    );
-    return {
-      id: pickup.id,
-      student_name: pickup.studentName,
-      from: pickup.fromLocation,
-      to: pickup.toLocation,
-      status: pickup.status,
-      fee_ghs: pickup.feeGhs,
-      notes: pickup.notes ?? null,
-      scheduled_at: pickup.scheduledAt ?? null,
-    };
-  },
-});
-
-const checkInPickupTool = Konsier.tool({
-  name: "pickup_check_in_next_step",
-  description:
-    "Advance the status of a pickup (pending → in_progress → completed). Use this when the runner has arrived or finished, and the student requests an update.",
-  input: z.object({
-    pickup_id: z.number().int().describe("The pickup ID to advance"),
-  }),
-  handler: async (input) => {
-    const result = await callApi<{ pickup: Pickup }>(
-      "POST",
-      `/api/pickups/${input.pickup_id}/check-in`,
-    );
-    return {
-      message: `Pickup #${result.pickup.id} is now ${result.pickup.status}.`,
-      pickup: {
-        id: result.pickup.id,
-        student_name: result.pickup.studentName,
-        from: result.pickup.fromLocation,
-        to: result.pickup.toLocation,
-        status: result.pickup.status,
-        fee_ghs: result.pickup.feeGhs,
-        notes: result.pickup.notes ?? null,
-        scheduled_at: result.pickup.scheduledAt ?? null,
-      },
-    };
-  },
-});
-
-const createPaystackLinkTool = Konsier.tool({
-  name: "pickup_create_paystack_link",
-  description:
-    "Create a Paystack payment link for a pickup so the student can pay the campus delivery fee.",
-  input: z.object({
-    pickup_id: z.number().int().describe("The pickup ID to pay for"),
-  }),
-  handler: async (input) => {
-    const result = await callApi<{
-      authorization_url: string;
-      reference: string;
-    }>("POST", `/api/pickups/${input.pickup_id}/paystack-link`);
-
-    return {
-      authorization_url: result.authorization_url,
-      reference: result.reference,
-    };
-  },
-});
-
-// Helper to send proactive messages back to the pickup owner
-async function notifyPickupUser(pickup: Pickup, text: string): Promise<void> {
-  if (!konsier) return;
-  if (!pickup.konsierUserId && !pickup.konsierConversationId) return;
-
-  try {
-    await konsier.sendMessage({
-      ...(pickup.konsierUserId ? { userId: pickup.konsierUserId } : {}),
-      ...(pickup.konsierConversationId
-        ? { conversationId: pickup.konsierConversationId }
-        : {}),
-      text,
-    });
-    // eslint-disable-next-line no-console
-    console.log("[KONSIER] Notification sent for pickup", pickup.id);
-  } catch (err: any) {
-    // eslint-disable-next-line no-console
-    console.error(
-      "[KONSIER] Failed to send notification:",
-      err?.message ?? err,
-    );
-  }
-}
-
-const konsier =
-  KONSIER_API_KEY === "REPLACE_WITH_REAL_API_KEY"
-    ? null
-    : new Konsier({
-        apiKey: KONSIER_API_KEY,
-        endpointUrl,
-        debug: true,
-        agents: {
-          campus_runner: {
-            name: "Campus Runner",
-            description:
-              "Helps students schedule and track item pickups on campus.",
-            systemPrompt: [
-              "You are Campus Runner, an assistant that helps students move items around campus.",
-              "",
-              "You can:",
-              "- Create new pickup requests from a student's natural description.",
-              "- List their recent pickups.",
-              "- Show the status of a specific pickup.",
-              "- Generate a Paystack payment link when they are ready to pay the fee.",
-              "",
-              "Always confirm key details (from where, to where, roughly when) before creating a pickup.",
-              "Use tools to fetch fresh status instead of guessing.",
-            ].join("\n"),
-            tools: [
-              createPickupTool,
-              listPickupsTool,
-              getPickupDetailsTool,
-              checkInPickupTool,
-              createPaystackLinkTool,
-            ],
-          },
-        },
-      });
-
-if (!konsier) {
-  // eslint-disable-next-line no-console
-  console.warn(
-    "[KONSIER] No KONSIER_API_KEY set. The HTTP API will run, but Konsier will not be connected.",
-  );
-} else {
-  // Mount Konsier webhook at /konsier (matches the configured endpoint URL path)
-  const handler = konsier.webhookHandler();
-  const webhookPath = konsier.webhookPath();
-  app.post(
-    webhookPath,
-    (req: Request, res: Response, next: NextFunction) => {
-      handler(req as any, res as any, next as any);
-    },
-  );
-}
+initKonsier(app);
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => {
-  // eslint-disable-next-line no-console
   console.log(`Campus demo server listening on port ${PORT}`);
 });
 
