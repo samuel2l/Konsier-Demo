@@ -1,7 +1,10 @@
 import type { Express, Request, Response, NextFunction } from "express";
 import { Konsier } from "konsier";
 import { z } from "zod";
-import { Pickup } from "./types";
+import { LocationPayload, MediaAttachment, Pickup } from "./types";
+import { listPickups, setPickupStatus } from "./pickups-store";
+import { createComplaint, listComplaints } from "./complaints-store";
+import { createReview, listReviews } from "./reviews-store";
 
 async function callApi<T>(
   method: "GET" | "POST",
@@ -23,6 +26,33 @@ const endpointUrl = process.env.KONSIER_ENDPOINT_URL || "";
 const KONSIER_API_KEY =
   process.env.KONSIER_API_KEY || "REPLACE_WITH_REAL_API_KEY";
 
+function summarizeRichContent(options?: {
+  attachments?: MediaAttachment[];
+  location?: LocationPayload;
+}) {
+  const attachments = options?.attachments ?? [];
+  const byType = attachments.reduce(
+    (acc, item) => {
+      acc[item.type] += 1;
+      return acc;
+    },
+    { image: 0, video: 0, file: 0 } as Record<"image" | "video" | "file", number>,
+  );
+  return {
+    attachments_total: attachments.length,
+    attachments_by_type: byType,
+    has_location: Boolean(options?.location),
+  };
+}
+
+const mediaAttachmentSchema = z.union([
+  Konsier.attachment.image(),
+  Konsier.attachment.video(),
+  Konsier.attachment.file(),
+]);
+
+const locationAttachmentSchema = Konsier.attachment.location();
+
 const createPickupTool = Konsier.tool({
   name: "pickup_create_from_description",
   description:
@@ -43,17 +73,48 @@ const createPickupTool = Konsier.tool({
       .string()
       .optional()
       .describe("Optional scheduled time"),
+    attachments: z
+      .array(mediaAttachmentSchema)
+      .max(10)
+      .optional()
+      .describe("Optional supporting image/video/file uploads"),
+    location: locationAttachmentSchema
+      .optional()
+      .describe("Optional GPS pin to help runner locate the user or item"),
   }),
   handler: async (input, ctx) => {
+    const normalizedAttachments = input.attachments?.map((item) => ({
+      type: item.type,
+      url: item.url,
+      ...(item.name ? { name: item.name } : {}),
+    }));
+    const normalizedLocation = input.location
+      ? {
+          latitude: input.location.latitude,
+          longitude: input.location.longitude,
+          ...(input.location.address ? { label: input.location.address } : {}),
+        }
+      : undefined;
+
     const body = {
       studentName: input.student_name,
       fromLocation: input.from_location,
       toLocation: input.to_location,
       notes: input.notes,
       scheduledAt: input.scheduled_at,
+      ...(normalizedAttachments ? { attachments: normalizedAttachments } : {}),
+      ...(normalizedLocation ? { location: normalizedLocation } : {}),
       konsierUserId: ctx.user?.id,
       konsierConversationId: ctx.conversation?.id,
     };
+    console.log("[KONSIER][pickup_create_from_description] normalized payload", {
+      user_id: ctx.user?.id ?? null,
+      conversation_id: ctx.conversation?.id ?? null,
+      ...summarizeRichContent({
+        ...(normalizedAttachments ? { attachments: normalizedAttachments } : {}),
+        ...(normalizedLocation ? { location: normalizedLocation } : {}),
+      }),
+    });
 
     const result = await callApi<{
       pickup_id: number;
@@ -145,45 +206,264 @@ const checkInPickupTool = Konsier.tool({
 });
 
 const createPaystackLinkTool = Konsier.tool({
-  name: "pickup_create_paystack_link",
+  name: "pickup_payment_instructions",
   description:
-    "Create a Paystack payment link for a pickup so the student can pay the campus delivery fee.",
+    "Provide payment instructions for a pickup (MOMO number or paying the rider directly).",
   input: z.object({
     pickup_id: z.number().int().describe("The pickup ID to pay for"),
   }),
   handler: async (input) => {
-    const result = await callApi<{
-      authorization_url: string;
-      reference: string;
-    }>("POST", `/api/pickups/${input.pickup_id}/paystack-link`);
-
     return {
-      authorization_url: result.authorization_url,
-      reference: result.reference,
+      pickup_id: input.pickup_id,
+      payment_instructions:
+        "Pay our MOMO number 0551642130 (or pay the rider directly when they arrive). Share the receipt with the runner.",
     };
   },
 });
 
+const complaintCreateTool = Konsier.tool({
+  name: "complaint_create",
+  description: "Submit a complaint about a pickup or rider experience.",
+  input: z.object({
+    pickup_id: z.number().int().optional().describe("Pickup ID (if known)"),
+    message: z.string().min(5).describe("Complaint details"),
+    attachments: z
+      .array(mediaAttachmentSchema)
+      .max(10)
+      .optional()
+      .describe("Optional proof like screenshots, video, or documents"),
+    location: locationAttachmentSchema
+      .optional()
+      .describe("Optional location where the issue happened"),
+  }),
+  handler: async (input, ctx) => {
+    const normalizedAttachments = input.attachments?.map((item) => ({
+      type: item.type,
+      url: item.url,
+      ...(item.name ? { name: item.name } : {}),
+    }));
+    const normalizedLocation = input.location
+      ? {
+          latitude: input.location.latitude,
+          longitude: input.location.longitude,
+          ...(input.location.address ? { label: input.location.address } : {}),
+        }
+      : undefined;
+
+    const complaint = createComplaint({
+      ...(input.pickup_id !== undefined ? { pickupId: input.pickup_id } : {}),
+      message: input.message,
+      ...(normalizedAttachments ? { attachments: normalizedAttachments } : {}),
+      ...(normalizedLocation ? { location: normalizedLocation } : {}),
+      konsierUserId: ctx.user?.id,
+      konsierConversationId: ctx.conversation?.id,
+    });
+
+    await notifyKonsierUser(
+      {
+        ...(complaint.konsierUserId ? { konsierUserId: complaint.konsierUserId } : {}),
+        ...(complaint.konsierConversationId !== undefined
+          ? { konsierConversationId: complaint.konsierConversationId }
+          : {}),
+      },
+      `Thanks—your complaint has been submitted. Reference: #${complaint.id}.`,
+    );
+
+    return {
+      complaint_id: complaint.id,
+      status: complaint.status,
+    };
+  },
+});
+
+const reviewCreateTool = Konsier.tool({
+  name: "review_create",
+  description: "Leave a review for a pickup.",
+  input: z.object({
+    pickup_id: z.number().int().optional().describe("Pickup ID (if known)"),
+    rating: z.number().int().min(1).max(5).describe("Rating 1 to 5"),
+    text: z.string().optional().describe("Short review text"),
+    attachments: z
+      .array(mediaAttachmentSchema)
+      .max(10)
+      .optional()
+      .describe("Optional media/files related to the feedback"),
+    location: locationAttachmentSchema
+      .optional()
+      .describe("Optional location where the pickup was completed"),
+  }),
+  handler: async (input, ctx) => {
+    const normalizedAttachments = input.attachments?.map((item) => ({
+      type: item.type,
+      url: item.url,
+      ...(item.name ? { name: item.name } : {}),
+    }));
+    const normalizedLocation = input.location
+      ? {
+          latitude: input.location.latitude,
+          longitude: input.location.longitude,
+          ...(input.location.address ? { label: input.location.address } : {}),
+        }
+      : undefined;
+
+    const review = createReview({
+      ...(input.pickup_id !== undefined ? { pickupId: input.pickup_id } : {}),
+      rating: input.rating as 1 | 2 | 3 | 4 | 5,
+      ...(input.text ? { text: input.text } : {}),
+      ...(normalizedAttachments ? { attachments: normalizedAttachments } : {}),
+      ...(normalizedLocation ? { location: normalizedLocation } : {}),
+      konsierUserId: ctx.user?.id,
+      konsierConversationId: ctx.conversation?.id,
+    });
+
+    await notifyKonsierUser(
+      {
+        ...(review.konsierUserId ? { konsierUserId: review.konsierUserId } : {}),
+        ...(review.konsierConversationId !== undefined
+          ? { konsierConversationId: review.konsierConversationId }
+          : {}),
+      },
+      `Thanks for the feedback! Your review was saved (rating: ${review.rating}).`,
+    );
+
+    return {
+      review_id: review.id,
+      rating: review.rating,
+    };
+  },
+});
+
+const adminListPickupsTool = Konsier.tool({
+  name: "admin_list_pickups",
+  description: "List all pickups (admin only).",
+  input: z.object({}),
+  handler: async () => {
+    const pickups = listPickups().map((p) => ({
+      id: p.id,
+      student_name: p.studentName,
+      from: p.fromLocation,
+      to: p.toLocation,
+      status: p.status,
+      fee_ghs: p.feeGhs,
+      scheduled_at: p.scheduledAt ?? null,
+    }));
+    return { count: pickups.length, pickups };
+  },
+});
+
+const adminSetPickupStatusTool = Konsier.tool({
+  name: "admin_set_pickup_status",
+  description: "Set a pickup status (admin only).",
+  input: z.object({
+    pickup_id: z.number().int(),
+    status: z.enum(["pending", "in_progress", "completed"]),
+  }),
+  handler: async (input) => {
+    const result = setPickupStatus(input.pickup_id, input.status);
+    if (!result.pickup) return { error: "Pickup not found" };
+    if (result.error) return { error: result.error };
+    return {
+      message: `Pickup #${result.pickup.id} set to ${result.pickup.status}.`,
+      pickup_id: result.pickup.id,
+      status: result.pickup.status,
+    };
+  },
+});
+
+const adminListComplaintsTool = Konsier.tool({
+  name: "admin_list_complaints",
+  description: "List complaints submitted by users (admin only).",
+  input: z.object({}),
+  handler: async () => {
+    const items = listComplaints().map((c) => ({
+      id: c.id,
+      pickup_id: c.pickupId ?? null,
+      message: c.message,
+      status: c.status,
+      created_at: c.createdAt,
+    }));
+    return { count: items.length, complaints: items };
+  },
+});
+
+const adminListReviewsTool = Konsier.tool({
+  name: "admin_list_reviews",
+  description: "List reviews submitted by users (admin only).",
+  input: z.object({}),
+  handler: async () => {
+    const items = listReviews().map((r) => ({
+      id: r.id,
+      pickup_id: r.pickupId ?? null,
+      rating: r.rating,
+      text: r.text ?? null,
+      created_at: r.createdAt,
+    }));
+    return { count: items.length, reviews: items };
+  },
+});
+
 let konsierInstance: Konsier | null = null;
+
+export async function notifyKonsierUser(
+  ids: { konsierUserId?: string; konsierConversationId?: string | number },
+  text: string,
+  options?: { attachments?: MediaAttachment[]; location?: LocationPayload },
+): Promise<void> {
+  if (!konsierInstance) return;
+  if (!ids.konsierUserId && !ids.konsierConversationId) return;
+
+  try {
+    const summary = summarizeRichContent(options);
+    console.log("[KONSIER][sendMessage] dispatching", {
+      user_id: ids.konsierUserId ?? null,
+      conversation_id: ids.konsierConversationId ?? null,
+      ...summary,
+    });
+
+    const payload = {
+      ...(ids.konsierUserId ? { userId: ids.konsierUserId } : {}),
+      ...(ids.konsierConversationId
+        ? { conversationId: ids.konsierConversationId }
+        : {}),
+      html: `<div style="font-family:system-ui,Segoe UI,Roboto,sans-serif;line-height:1.35"><b>Campus Runner</b><br/>${text}</div>`,
+      attachments: options?.attachments ?? [
+        {
+          type: "image",
+          url: "https://placehold.co/640x360/png?text=Campus+Runner",
+          name: "campus-runner.png",
+        },
+      ],
+      ...(options?.location ? { location: options.location } : {}),
+    };
+    await konsierInstance.sendMessage(payload as any);
+    console.log("[KONSIER][sendMessage] delivered", {
+      user_id: ids.konsierUserId ?? null,
+      conversation_id: ids.konsierConversationId ?? null,
+      ...summary,
+    });
+  } catch {
+    console.error("[KONSIER][sendMessage] failed");
+  }
+}
 
 export async function notifyPickupUser(
   pickup: Pickup,
   text: string,
 ): Promise<void> {
   if (!konsierInstance) return;
-  if (!pickup.konsierUserId && !pickup.konsierConversationId) return;
-
-  try {
-    await konsierInstance.sendMessage({
-      ...(pickup.konsierUserId ? { userId: pickup.konsierUserId } : {}),
-      ...(pickup.konsierConversationId
-        ? { conversationId: pickup.konsierConversationId }
+  await notifyKonsierUser(
+    {
+      ...(pickup.konsierUserId ? { konsierUserId: pickup.konsierUserId } : {}),
+      ...(pickup.konsierConversationId !== undefined
+        ? { konsierConversationId: pickup.konsierConversationId }
         : {}),
-      text,
-    });
-  } catch {
-    /* ignore in demo */
-  }
+    },
+    text,
+    {
+      ...(pickup.attachments ? { attachments: pickup.attachments } : {}),
+      ...(pickup.location ? { location: pickup.location } : {}),
+    },
+  );
 }
 
 export function initKonsier(app: Express): Konsier | null {
@@ -210,9 +490,11 @@ export function initKonsier(app: Express): Konsier | null {
           "- Create new pickup requests from a student's natural description.",
           "- List their recent pickups.",
           "- Show the status of a specific pickup.",
-          "- Generate a Paystack payment link when they are ready to pay the fee.",
+          "- Provide payment instructions when they are ready to pay the fee.",
+          "- Collect supporting image/video/file evidence and optional location pins.",
           "",
           "Always confirm key details (from where, to where, roughly when) before creating a pickup.",
+          "When the user uploads media or shares a location, include them in tool arguments as attachments/location fields.",
           "Use tools to fetch fresh status instead of guessing.",
         ].join("\n"),
         tools: [
@@ -221,10 +503,18 @@ export function initKonsier(app: Express): Konsier | null {
           getPickupDetailsTool,
           checkInPickupTool,
           createPaystackLinkTool,
+          complaintCreateTool,
+          reviewCreateTool,
         ],
       },
     },
     internal: {
+      tools: [
+        adminListPickupsTool,
+        adminSetPickupStatusTool,
+        adminListComplaintsTool,
+        adminListReviewsTool,
+      ],
       pages: [
         {
           name: "Pickups",
